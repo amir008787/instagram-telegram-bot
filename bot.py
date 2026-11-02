@@ -1,7 +1,7 @@
 
+import os
 import asyncio
 import logging
-import os
 import instaloader
 
 from telegram import Update
@@ -14,8 +14,8 @@ from telegram.ext import (
 )
 
 logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
 loader = instaloader.Instaloader(quiet=True)
@@ -23,7 +23,9 @@ loader = instaloader.Instaloader(quiet=True)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "سلام! آیدی پیج عمومی اینستاگرام را بفرست."
+        "سلام!\n"
+        "آیدی یک پیج عمومی اینستاگرام را بفرست.\n"
+        "مثال: instagram"
     )
 
 
@@ -34,7 +36,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("آیدی معتبر وارد کن.")
         return
 
-    msg = await update.message.reply_text("در حال بررسی...")
+    msg = await update.message.reply_text("در حال بررسی استوری‌ها...")
 
     try:
         profile = await asyncio.to_thread(
@@ -43,18 +45,48 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             username
         )
 
-        result = (
-            f"پیج: @{profile.username}\n"
-            f"فالوورها: {profile.followers}\n"
-            f"فالووینگ‌ها: {profile.followees}"
+        if profile.is_private:
+            await msg.edit_text("این پیج خصوصی است.")
+            return
+
+        stories = await asyncio.to_thread(
+            lambda: list(loader.get_stories(userids=[profile.userid]))
         )
 
-        await msg.edit_text(result)
+        items = []
+        for story in stories:
+            items.extend(list(story.get_items()))
+
+        if not items:
+            await msg.edit_text("استوری فعالی پیدا نشد یا دسترسی ممکن نیست.")
+            return
+
+        await msg.edit_text(
+            f"تعداد استوری‌های پیدا شده: {len(items)}\n"
+            "در حال ارسال..."
+        )
+
+        for item in items:
+            try:
+                if item.is_video:
+                    await update.message.reply_video(
+                        video=item.video_url,
+                        caption=f"استوری @{username}"
+                    )
+                else:
+                    await update.message.reply_photo(
+                        photo=item.url,
+                        caption=f"استوری @{username}"
+                    )
+            except Exception:
+                logging.exception("Story sending failed")
+
+        await update.message.reply_text("ارسال استوری‌ها تمام شد.")
 
     except Exception:
-        logging.exception("Instagram profile retrieval failed")
+        logging.exception("Story retrieval failed")
         await msg.edit_text(
-            "دریافت اطلاعات ناموفق بود. لطفاً بعداً دوباره تلاش کن."
+            "دریافت استوری ناموفق بود. ممکن است اینستاگرام دسترسی را محدود کرده باشد."
         )
 
 
@@ -64,10 +96,9 @@ def main():
     app = Application.builder().token(token).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND,
-        handle
-    ))
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle)
+    )
 
     logging.info("Bot is running...")
     app.run_polling()
