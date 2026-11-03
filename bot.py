@@ -5,8 +5,8 @@ import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
 
+import requests
 import yt_dlp
-import instaloader
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
@@ -15,7 +15,6 @@ from telegram.ext import (
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 MAX_SIZE = 45 * 1024 * 1024
 WAITING_DOWNLOAD, WAITING_PROFILE = range(2)
 
@@ -23,13 +22,11 @@ MAIN_TEXT = "🌟 به ربات اینستاگرام خوش آمدید"
 DOWNLOAD_PROMPT = "📥 لینک ریلز و پست مورد نظر را ارسال کنید"
 PROFILE_PROMPT = "👤 لطفاً آیدی یا لینک پیج عمومی اینستاگرام را ارسال کنید."
 
-
 def main_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📥 دانلود ریلز و پست", callback_data="download")],
         [InlineKeyboardButton("👤 اطلاعات پیج", callback_data="profile")],
     ])
-
 
 def profile_keyboard():
     return InlineKeyboardMarkup([
@@ -44,7 +41,6 @@ def profile_keyboard():
         [InlineKeyboardButton("🏠 منوی اصلی", callback_data="home")],
     ])
 
-
 def normalize_username(value):
     value = value.strip()
     if "instagram.com" in value:
@@ -58,24 +54,38 @@ def normalize_username(value):
         raise ValueError("شناسه پیج معتبر نیست.")
     return value
 
-
 def get_profile(username):
-    loader = instaloader.Instaloader(
-        download_pictures=False, download_videos=False,
-        download_video_thumbnails=False, download_geotags=False,
-        download_comments=False, save_metadata=False, quiet=True
-    )
-    profile = instaloader.Profile.from_username(loader.context, username)
-    return {
-        "username": profile.username,
-        "full_name": profile.full_name or profile.username,
-        "followers": profile.followers,
-        "following": profile.followees,
-        "posts": profile.mediacount,
-        "photo": profile.profile_pic_url,
-        "private": profile.is_private,
-    }
+    api_key = os.environ.get("IGRAM_API_KEY")
+    if not api_key:
+        raise RuntimeError("IGRAM_API_KEY is not configured")
 
+    response = requests.get(
+        f"https://api.igramapi.com/v1/profiles/{username}",
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=30,
+    )
+
+    if response.status_code == 404:
+        raise ValueError("پیج پیدا نشد.")
+    if response.status_code == 401:
+        raise RuntimeError("کلید API نامعتبر است.")
+    if response.status_code == 402:
+        raise RuntimeError("اعتبار API تمام شده است.")
+    if response.status_code == 429:
+        raise RuntimeError("محدودیت درخواست API؛ کمی بعد دوباره امتحان کنید.")
+    response.raise_for_status()
+
+    data = response.json()
+    profile = data.get("profile", data)
+    return {
+        "username": profile.get("username") or username,
+        "full_name": profile.get("full_name") or profile.get("username") or username,
+        "followers": profile.get("followers", 0),
+        "following": profile.get("following", 0),
+        "posts": profile.get("posts_count", 0),
+        "photo": profile.get("profile_picture_url"),
+        "private": profile.get("is_private", False),
+    }
 
 def download_media(url, folder):
     options = {
@@ -88,11 +98,9 @@ def download_media(url, folder):
         info = ydl.extract_info(url, download=True)
         return ydl.prepare_filename(info)
 
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text(MAIN_TEXT, reply_markup=main_keyboard())
-
 
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -102,35 +110,28 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if choice == "download":
         await query.message.reply_text(DOWNLOAD_PROMPT)
         return WAITING_DOWNLOAD
-
     if choice == "profile":
         await query.message.reply_text(PROFILE_PROMPT)
         return WAITING_PROFILE
-
     if choice == "home":
         context.user_data.clear()
         await query.message.reply_text(MAIN_TEXT, reply_markup=main_keyboard())
         return ConversationHandler.END
-
     if choice in ("followers", "following"):
         await query.message.reply_text(
-            "⚠️ اینستاگرام دسترسی پایدار و عمومی برای دریافت فهرست کامل "
-            "فالوورها و فالووینگِ پیج‌های دلخواه ارائه نمی‌کند؛ بنابراین "
-            "نمایش فهرست کامل و قابل‌اعتماد ممکن نیست."
+            "⚠️ نمایش فهرست کامل فالوورها و فالووینگِ پیج‌های دیگر در این نسخه پشتیبانی نمی‌شود."
         )
     elif choice == "stories":
         await query.message.reply_text(
-            "⚠️ قابلیت دریافت استوری در این نسخه فعال نیست. "
-            "دسترسی به استوری‌ها به عمومی و قابل‌دسترسی بودن آن‌ها بستگی دارد."
+            "⚠️ دریافت استوری در پلن فعلی API فعال نیست."
         )
     elif choice == "posts":
         await query.message.reply_text(
-            "🖼 برای دریافت پست یا ریلز، لینک عمومی آن را کپی کنید و از گزینه "
-            "«دانلود ریلز و پست» بفرستید. نمایش خودکار گالری پست‌ها هنوز فعال نیست.",
+            "🖼 برای دریافت پست یا ریلز، لینک عمومی آن را از گزینه «دانلود ریلز و پست» ارسال کنید. "
+            "نمایش خودکار گالری پست‌ها هنوز فعال نیست.",
             reply_markup=main_keyboard()
         )
     return ConversationHandler.END
-
 
 async def receive_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -147,22 +148,29 @@ async def receive_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption = (
             f"👤 {info['full_name']}\n"
             f"🆔 @{info['username']}\n\n"
-            f"👥 دنبال‌کنندگان: {info['followers']:,}\n"
-            f"➡️ دنبال‌شوندگان: {info['following']:,}\n"
-            f"🖼 تعداد پست‌ها: {info['posts']:,}"
+            f"👥 دنبال‌کنندگان: {int(info['followers']):,}\n"
+            f"➡️ دنبال‌شوندگان: {int(info['following']):,}\n"
+            f"🖼 تعداد پست‌ها: {int(info['posts']):,}"
         )
-        await update.message.reply_photo(
-            photo=info["photo"], caption=caption, reply_markup=profile_keyboard()
+        if info["photo"]:
+            await update.message.reply_photo(
+                photo=info["photo"], caption=caption, reply_markup=profile_keyboard()
+            )
+        else:
+            await update.message.reply_text(caption, reply_markup=profile_keyboard())
+    except requests.HTTPError as exc:
+        logger.exception("IGramAPI HTTP error")
+        await update.message.reply_text(
+            "❌ سرویس اطلاعات پیج پاسخ مناسبی نداد. لطفاً بعداً دوباره امتحان کنید.",
+            reply_markup=main_keyboard()
         )
     except Exception:
         logger.exception("Profile lookup failed")
         await update.message.reply_text(
-            "❌ دریافت اطلاعات پیج ناموفق بود. آیدی را بررسی کنید؛ "
-            "ممکن است اینستاگرام موقتاً دسترسی را محدود کرده باشد.",
+            "❌ دریافت اطلاعات پیج ناموفق بود. آیدی را بررسی کنید یا کمی بعد دوباره امتحان کنید.",
             reply_markup=main_keyboard()
         )
     return ConversationHandler.END
-
 
 async def receive_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = (update.message.text or "").strip()
@@ -170,7 +178,6 @@ async def receive_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if parsed.netloc.lower() not in ("instagram.com", "www.instagram.com", "m.instagram.com"):
         await update.message.reply_text("لطفاً لینک معتبر اینستاگرام ارسال کنید.")
         return WAITING_DOWNLOAD
-
     status = await update.message.reply_text("⏳ در حال دریافت محتوا...")
     try:
         with tempfile.TemporaryDirectory() as folder:
@@ -183,7 +190,6 @@ async def receive_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 path = files[0]
             if path.stat().st_size > MAX_SIZE:
                 raise RuntimeError("حجم فایل بیشتر از حد مجاز است.")
-
             with path.open("rb") as media:
                 if path.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
                     await update.message.reply_photo(photo=media, caption="دریافت از اینستاگرام")
@@ -201,22 +207,20 @@ async def receive_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     return ConversationHandler.END
 
-
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("عملیات لغو شد.", reply_markup=main_keyboard())
     return ConversationHandler.END
 
-
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("از منوی اصلی یکی از گزینه‌ها را انتخاب کنید.",
-                                    reply_markup=main_keyboard())
-
+    await update.message.reply_text(
+        "از منوی اصلی یکی از گزینه‌ها را انتخاب کنید.",
+        reply_markup=main_keyboard()
+    )
 
 def main():
     token = os.environ.get("BOT_TOKEN")
     if not token:
         raise RuntimeError("متغیر محیطی BOT_TOKEN تنظیم نشده است.")
-
     app = Application.builder().token(token).build()
     conversation = ConversationHandler(
         entry_points=[CallbackQueryHandler(
@@ -236,6 +240,6 @@ def main():
     logger.info("Bot is running")
     app.run_polling()
 
-
 if __name__ == "__main__":
     main()
+
