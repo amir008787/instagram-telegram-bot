@@ -1,5 +1,6 @@
 
 import os
+import re
 import asyncio
 import logging
 import tempfile
@@ -15,21 +16,27 @@ from telegram.ext import (
     ConversationHandler, ContextTypes, filters
 )
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# ---------------- CONFIG ----------------
 
-MAX_SIZE = 45 * 1024 * 1024
-WAITING_DOWNLOAD, WAITING_PROFILE = range(2)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 HIKER_URL = "https://api.hikerapi.com"
 IGRAM_URL = "https://api.igramapi.com"
+
+MAX_SIZE = 45 * 1024 * 1024
+MAX_ITEMS = 20
+WAITING_DOWNLOAD, WAITING_PROFILE = range(2)
 
 MAIN_TEXT = "🌟 به ربات اینستاگرام خوش آمدید"
 DOWNLOAD_PROMPT = "📥 لینک ریلز و پست مورد نظر را ارسال کنید"
 PROFILE_PROMPT = "👤 لطفاً آیدی یا لینک پیج عمومی اینستاگرام را ارسال کنید."
 
 
-# -------------------- KEYBOARDS --------------------
+# ---------------- MENUS ----------------
 
 def main_keyboard():
     return InlineKeyboardMarkup([
@@ -53,33 +60,38 @@ def profile_keyboard():
     ])
 
 
-# -------------------- HELPERS --------------------
+# ---------------- USERNAME ----------------
 
 def normalize_username(value):
     value = value.strip()
 
-    if "instagram.com" in value:
+    if "instagram.com" in value.lower():
         parsed = urlparse(
             value if value.startswith(("http://", "https://"))
             else "https://" + value
         )
         parts = [p for p in parsed.path.split("/") if p]
+
         if not parts:
-            raise ValueError("شناسه پیج معتبر نیست.")
+            raise ValueError("لینک پیج معتبر نیست.")
+
         value = parts[0]
 
-    value = value.lstrip("@").strip("/")
+    value = value.strip().lstrip("@").strip("/")
 
-    if not value or any(ch in value for ch in " ?#"):
-        raise ValueError("شناسه پیج معتبر نیست.")
+    if not re.fullmatch(r"[A-Za-z0-9._]{1,30}", value):
+        raise ValueError("آیدی پیج معتبر نیست.")
 
     return value
 
 
+# ---------------- API REQUESTS ----------------
+
 def hiker_get(endpoint, params=None):
-    key = os.environ.get("HIKER_API_KEY")
+    key = os.getenv("HIKER_API_KEY")
+
     if not key:
-        raise RuntimeError("HIKER_API_KEY تنظیم نشده است.")
+        raise RuntimeError("کلید HIKER_API_KEY در سرور تنظیم نشده است.")
 
     response = requests.get(
         HIKER_URL + endpoint,
@@ -88,26 +100,57 @@ def hiker_get(endpoint, params=None):
             "accept": "application/json"
         },
         params=params or {},
-        timeout=40
+        timeout=45
     )
 
     if response.status_code == 401:
         raise RuntimeError("کلید HikerAPI نامعتبر است.")
     if response.status_code == 402:
-        raise RuntimeError("اعتبار HikerAPI کافی نیست.")
+        raise RuntimeError("اعتبار HikerAPI تمام شده است.")
     if response.status_code == 403:
         raise RuntimeError("دسترسی به این اطلاعات مجاز نیست.")
     if response.status_code == 404:
-        raise ValueError("اطلاعات موردنظر پیدا نشد.")
+        raise ValueError("پیج یا محتوای موردنظر پیدا نشد.")
+    if response.status_code == 429:
+        raise RuntimeError("محدودیت درخواست API؛ کمی بعد دوباره امتحان کنید.")
 
     response.raise_for_status()
     return response.json()
 
 
-def get_profile(username):
-    # First try IGramAPI
-    igram_key = os.environ.get("IGRAM_API_KEY")
+def get_items(data):
+    """Extract lists from common HikerAPI response envelopes."""
 
+    if isinstance(data, list):
+        return data
+
+    if not isinstance(data, dict):
+        return []
+
+    for key in (
+        "items", "users", "stories", "medias",
+        "tray", "highlights", "results"
+    ):
+        value = data.get(key)
+        if isinstance(value, list):
+            return value
+
+    for key in ("response", "data", "reel"):
+        value = data.get(key)
+        if isinstance(value, (dict, list)):
+            result = get_items(value)
+            if result:
+                return result
+
+    return []
+
+
+# ---------------- PROFILE ----------------
+
+def get_profile(username):
+    igram_key = os.getenv("IGRAM_API_KEY")
+
+    # Try IGramAPI first
     if igram_key:
         try:
             response = requests.get(
@@ -115,8 +158,8 @@ def get_profile(username):
                 headers={"Authorization": f"Bearer {igram_key}"},
                 timeout=30
             )
-            response.raise_for_status()
 
+            response.raise_for_status()
             data = response.json()
             p = data.get("profile", data)
 
@@ -130,10 +173,11 @@ def get_profile(username):
                 "private": p.get("is_private", False),
                 "user_id": p.get("id") or p.get("pk")
             }
-        except Exception:
-            logger.warning("IGramAPI failed; trying HikerAPI")
 
-    # HikerAPI fallback
+        except Exception:
+            logger.exception("IGramAPI profile lookup failed")
+
+    # Fallback to HikerAPI
     p = hiker_get(
         "/v1/user/by/username",
         {"username": username}
@@ -151,39 +195,22 @@ def get_profile(username):
     }
 
 
-def get_items(data):
-    """Extract common list formats returned by HikerAPI."""
-    if isinstance(data, list):
-        return data
-
-    if not isinstance(data, dict):
-        return []
-
-    for key in ("users", "items", "stories", "tray", "highlights", "medias"):
-        value = data.get(key)
-        if isinstance(value, list):
-            return value
-
-    response = data.get("response")
-    if isinstance(response, dict):
-        return get_items(response)
-
-    reel = data.get("reel")
-    if isinstance(reel, dict):
-        return reel.get("items", [])
-
-    return []
-
-
-def get_user_list(username, kind):
+def get_public_profile(username):
     profile = get_profile(username)
 
-    if profile["private"]:
-        raise ValueError("این پیج خصوصی است.")
+    if profile.get("private"):
+        raise ValueError("این پیج خصوصی است. فقط پیج‌های عمومی پشتیبانی می‌شوند.")
 
-    user_id = profile.get("user_id")
-    if not user_id:
+    if not profile.get("user_id"):
         raise RuntimeError("شناسه پیج از API دریافت نشد.")
+
+    return profile
+
+
+# ---------------- FOLLOWERS / FOLLOWING ----------------
+
+def get_user_list(username, kind):
+    profile = get_public_profile(username)
 
     endpoint = (
         "/v1/user/followers/chunk"
@@ -191,67 +218,167 @@ def get_user_list(username, kind):
         else "/v1/user/following/chunk"
     )
 
-    data = hiker_get(endpoint, {"user_id": user_id})
+    data = hiker_get(
+        endpoint,
+        {"user_id": profile["user_id"]}
+    )
+
     return get_items(data)
 
+
+# ---------------- STORIES ----------------
 
 def get_stories(username):
+    profile = get_public_profile(username)
+
     data = hiker_get(
-        "/v2/user/stories/by/username",
+        "/v1/user/stories/by/username",
         {"username": username}
     )
+
     return get_items(data)
 
+
+# ---------------- HIGHLIGHTS ----------------
 
 def get_highlights(username):
+    profile = get_public_profile(username)
+
     data = hiker_get(
-        "/v2/user/highlights/by/username",
-        {"username": username}
+        "/v1/user/highlights",
+        {
+            "user_id": profile["user_id"],
+            "amount": 10
+        }
     )
+
     return get_items(data)
 
 
+# ---------------- POSTS ----------------
+
 def get_posts(username):
-    profile = get_profile(username)
-
-    if profile["private"]:
-        raise ValueError("این پیج خصوصی است.")
-
-    user_id = profile.get("user_id")
-    if not user_id:
-        raise RuntimeError("شناسه پیج دریافت نشد.")
+    profile = get_public_profile(username)
 
     data = hiker_get(
         "/v1/user/medias/chunk",
-        {"user_id": user_id}
+        {"user_id": profile["user_id"]}
     )
+
     return get_items(data)
 
 
-def extract_media_url(item):
+# ---------------- MEDIA EXTRACTION ----------------
+
+def extract_media(item):
     if not isinstance(item, dict):
-        return None
+        return None, None
 
-    for key in (
-        "video_url", "image_url", "display_url",
-        "thumbnail_url", "url"
-    ):
-        value = item.get(key)
-        if isinstance(value, str) and value.startswith("http"):
-            return value
+    # Video
+    videos = item.get("video_versions") or []
 
-    candidates = item.get("image_versions2", {}).get("candidates", [])
+    if videos:
+        video = videos[0].get("url")
+        if video:
+            return "video", video
+
+    video_url = item.get("video_url")
+
+    if video_url:
+        return "video", video_url
+
+    # Image
+    image_data = item.get("image_versions2") or {}
+    candidates = image_data.get("candidates") or []
+
     if candidates:
-        return candidates[0].get("url")
+        image_url = candidates[0].get("url")
+        if image_url:
+            return "photo", image_url
 
-    versions = item.get("video_versions", [])
-    if versions:
-        return versions[0].get("url")
+    for key in ("image_url", "display_url", "thumbnail_url"):
+        value = item.get(key)
 
-    return None
+        if isinstance(value, str) and value.startswith("http"):
+            return "photo", value
+
+    return None, None
 
 
-def download_media(url, folder):
+# ---------------- MEDIA DOWNLOAD ----------------
+
+def download_url(url, folder, filename):
+    response = requests.get(
+        url,
+        stream=True,
+        timeout=60,
+        headers={"User-Agent": "Mozilla/5.0"}
+    )
+    response.raise_for_status()
+
+    content_type = response.headers.get("content-type", "").lower()
+
+    if "video" in content_type:
+        extension = ".mp4"
+    elif "webp" in content_type:
+        extension = ".webp"
+    elif "png" in content_type:
+        extension = ".png"
+    else:
+        extension = ".jpg"
+
+    path = Path(folder) / (filename + extension)
+    total = 0
+
+    with path.open("wb") as file:
+        for chunk in response.iter_content(256 * 1024):
+            if not chunk:
+                continue
+
+            total += len(chunk)
+
+            if total > MAX_SIZE:
+                raise RuntimeError("حجم رسانه بیشتر از حد مجاز است.")
+
+            file.write(chunk)
+
+    return path
+
+
+async def send_media_item(message, item, index):
+    kind, url = extract_media(item)
+
+    if not url:
+        return False
+
+    try:
+        with tempfile.TemporaryDirectory() as folder:
+            path = await asyncio.to_thread(
+                download_url,
+                url,
+                folder,
+                f"media_{index}"
+            )
+
+            with path.open("rb") as media:
+                if kind == "video":
+                    await message.reply_video(
+                        video=media,
+                        supports_streaming=True
+                    )
+                else:
+                    await message.reply_photo(photo=media)
+
+        return True
+
+    except Exception:
+        logger.exception("Media sending failed")
+        return False
+
+
+# ---------------- POST / REEL DOWNLOAD ----------------
+
+def download_instagram_post(url, folder):
     options = {
         "outtmpl": str(Path(folder) / "%(id)s.%(ext)s"),
         "format": "best",
@@ -259,7 +386,7 @@ def download_media(url, folder):
         "quiet": True,
         "no_warnings": True,
         "max_filesize": MAX_SIZE,
-        "socket_timeout": 30,
+        "socket_timeout": 40,
         "retries": 2
     }
 
@@ -268,15 +395,34 @@ def download_media(url, folder):
         return ydl.prepare_filename(info)
 
 
-# -------------------- TELEGRAM COMMANDS --------------------
+# ---------------- TELEGRAM START ----------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
+
     await update.message.reply_text(
         MAIN_TEXT,
         reply_markup=main_keyboard()
     )
 
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "از منوی اصلی یکی از گزینه‌ها را انتخاب کنید.",
+        reply_markup=main_keyboard()
+    )
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "عملیات لغو شد.",
+        reply_markup=main_keyboard()
+    )
+
+    return ConversationHandler.END
+
+
+# ---------------- PROFILE MENU CALLBACK ----------------
 
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -294,17 +440,19 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if choice == "home":
         context.user_data.clear()
+
         await query.message.reply_text(
             MAIN_TEXT,
             reply_markup=main_keyboard()
         )
+
         return ConversationHandler.END
 
     username = context.user_data.get("profile_username")
 
     if not username:
         await query.message.reply_text(
-            "ابتدا از منوی اصلی اطلاعات یک پیج را دریافت کنید.",
+            "ابتدا اطلاعات یک پیج را دریافت کنید.",
             reply_markup=main_keyboard()
         )
         return ConversationHandler.END
@@ -312,89 +460,108 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = await query.message.reply_text("⏳ در حال دریافت اطلاعات...")
 
     try:
+        # Followers / following
         if choice in ("followers", "following"):
             items = await asyncio.to_thread(
-                get_user_list, username, choice
+                get_user_list,
+                username,
+                choice
             )
 
             title = "فالوورها" if choice == "followers" else "فالووینگ"
 
-            if not items:
-                result = "فهرستی دریافت نشد."
-            else:
-                lines = []
-                for item in items[:30]:
-                    if isinstance(item, dict):
-                        name = item.get("username", "نامشخص")
-                        full = item.get("full_name", "")
-                        lines.append(f"👤 @{name} {full}")
+            lines = []
 
-                result = "\n".join(lines) or "اطلاعاتی دریافت نشد."
+            for item in items[:30]:
+                if not isinstance(item, dict):
+                    continue
+
+                name = item.get("username") or "نامشخص"
+                full_name = item.get("full_name") or ""
+
+                lines.append(f"👤 @{name} {full_name}")
+
+            result = "\n".join(lines) or "فهرستی دریافت نشد."
 
             await status.edit_text(
-                f"📋 {title} پیج @{username}\n\n{result}\n\n"
+                f"📋 {title} پیج @{username}\n\n"
+                f"{result}\n\n"
                 "نمایش حداکثر ۳۰ مورد از صفحه اول."
             )
 
-        elif choice in ("stories", "highlights", "posts"):
-            if choice == "stories":
-                items = await asyncio.to_thread(get_stories, username)
-                title = "استوری‌ها"
-            elif choice == "highlights":
-                items = await asyncio.to_thread(get_highlights, username)
-                title = "هایلایت‌ها"
-            else:
-                items = await asyncio.to_thread(get_posts, username)
-                title = "پست‌ها و ریلزها"
+            return ConversationHandler.END
 
-            if not items:
-                await status.edit_text(
-                    f"محتوایی برای نمایش در بخش {title} پیدا نشد."
-                )
-                return ConversationHandler.END
+        # Stories
+        if choice == "stories":
+            items = await asyncio.to_thread(get_stories, username)
+            title = "استوری‌ها"
 
+        # Highlights
+        elif choice == "highlights":
+            items = await asyncio.to_thread(get_highlights, username)
+            title = "هایلایت‌ها"
+
+        # Posts
+        elif choice == "posts":
+            items = await asyncio.to_thread(get_posts, username)
+            title = "پست‌ها و ریلزها"
+
+        else:
+            return ConversationHandler.END
+
+        if not items:
             await status.edit_text(
-                f"📥 {title} پیج @{username}\n"
-                f"تعداد موارد دریافت‌شده: {len(items)}"
+                f"محتوایی در بخش {title} پیدا نشد."
+            )
+            return ConversationHandler.END
+
+        await status.edit_text(
+            f"📥 {title} پیج @{username}\n"
+            f"تعداد موارد دریافت‌شده: {len(items)}\n"
+            "⏳ در حال ارسال..."
+        )
+
+        sent = 0
+        failed = 0
+
+        for index, item in enumerate(items[:MAX_ITEMS], start=1):
+            success = await send_media_item(
+                query.message,
+                item,
+                index
             )
 
-            for item in items[:5]:
-                media_url = extract_media_url(item)
+            if success:
+                sent += 1
+            else:
+                failed += 1
 
-                if not media_url:
-                    continue
-
-                try:
-                    await query.message.reply_photo(
-                        photo=media_url
-                    )
-                except Exception:
-                    try:
-                        await query.message.reply_video(
-                            video=media_url
-                        )
-                    except Exception:
-                        logger.warning("Could not send media")
-
-        return ConversationHandler.END
+        await query.message.reply_text(
+            f"✅ ارسال {title} تمام شد.\n"
+            f"موفق: {sent}\n"
+            f"ناموفق: {failed}"
+        )
 
     except Exception as exc:
-        logger.exception("API request failed")
-        await status.edit_text(f"❌ خطا: {str(exc)[:250]}")
-        return ConversationHandler.END
+        logger.exception("Menu API error")
 
+        await status.edit_text(
+            f"❌ خطا در دریافت اطلاعات:\n{str(exc)[:250]}"
+        )
+
+    return ConversationHandler.END
+
+
+# ---------------- RECEIVE PROFILE ----------------
 
 async def receive_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         username = normalize_username(update.message.text or "")
-        info = await asyncio.to_thread(get_profile, username)
 
-        if info["private"]:
-            await update.message.reply_text(
-                "🔒 این پیج خصوصی است. فقط پیج‌های عمومی پشتیبانی می‌شوند.",
-                reply_markup=main_keyboard()
-            )
-            return ConversationHandler.END
+        info = await asyncio.to_thread(
+            get_public_profile,
+            username
+        )
 
         context.user_data["profile_username"] = info["username"]
 
@@ -406,7 +573,7 @@ async def receive_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🖼 تعداد پست‌ها: {int(info['posts'] or 0):,}"
         )
 
-        if info["photo"]:
+        if info.get("photo"):
             await update.message.reply_photo(
                 photo=info["photo"],
                 caption=caption,
@@ -418,15 +585,18 @@ async def receive_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=profile_keyboard()
             )
 
-    except Exception:
+    except Exception as exc:
         logger.exception("Profile lookup failed")
+
         await update.message.reply_text(
-            "❌ دریافت اطلاعات پیج ناموفق بود. آیدی را بررسی کنید.",
+            f"❌ دریافت اطلاعات پیج ناموفق بود:\n{str(exc)[:200]}",
             reply_markup=main_keyboard()
         )
 
     return ConversationHandler.END
 
+
+# ---------------- RECEIVE DOWNLOAD LINK ----------------
 
 async def receive_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = (update.message.text or "").strip()
@@ -436,8 +606,10 @@ async def receive_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else "https://" + url
     )
 
-    if parsed.netloc.lower() not in (
-        "instagram.com", "www.instagram.com", "m.instagram.com"
+    if parsed.hostname not in (
+        "instagram.com",
+        "www.instagram.com",
+        "m.instagram.com"
     ):
         await update.message.reply_text(
             "لطفاً لینک معتبر اینستاگرام ارسال کنید."
@@ -449,15 +621,19 @@ async def receive_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         with tempfile.TemporaryDirectory() as folder:
             filename = await asyncio.to_thread(
-                download_media, url, folder
+                download_instagram_post,
+                url,
+                folder
             )
 
             path = Path(filename)
 
             if not path.exists():
                 files = list(Path(folder).glob("*"))
+
                 if not files:
                     raise RuntimeError("فایل دانلود نشد.")
+
                 path = files[0]
 
             if path.stat().st_size > MAX_SIZE:
@@ -481,35 +657,22 @@ async def receive_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status.delete()
 
     except Exception:
-        logger.exception("Download failed")
+        logger.exception("Instagram download failed")
+
         await status.edit_text(
-            "❌ دانلود ناموفق بود. ممکن است لینک خصوصی یا غیرقابل‌دسترسی باشد."
+            "❌ دانلود ناموفق بود. ممکن است لینک خصوصی، نامعتبر "
+            "یا از طرف اینستاگرام غیرقابل‌دسترسی باشد."
         )
 
     return ConversationHandler.END
 
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "عملیات لغو شد.",
-        reply_markup=main_keyboard()
-    )
-    return ConversationHandler.END
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "از منوی اصلی یکی از گزینه‌ها را انتخاب کنید.",
-        reply_markup=main_keyboard()
-    )
-
-
-# -------------------- MAIN --------------------
+# ---------------- MAIN ----------------
 
 def main():
     token = (
-        os.environ.get("BOT_TOKEN")
-        or os.environ.get("TELEGRAM_BOT_TOKEN")
+        os.getenv("BOT_TOKEN")
+        or os.getenv("TELEGRAM_BOT_TOKEN")
     )
 
     if not token:
@@ -521,7 +684,10 @@ def main():
         entry_points=[
             CallbackQueryHandler(
                 menu_callback,
-                pattern="^(download|profile|home|followers|following|stories|posts|highlights)$"
+                pattern=(
+                    "^(download|profile|home|followers|following|"
+                    "stories|posts|highlights)$"
+                )
             )
         ],
         states={
@@ -538,7 +704,9 @@ def main():
                 )
             ]
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel)
+        ],
         allow_reentry=True
     )
 
@@ -546,9 +714,10 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(conversation)
 
-    logger.info("Bot is running")
+    logger.info("Instagram Telegram bot is running")
     app.run_polling()
 
 
 if __name__ == "__main__":
     main()
+
